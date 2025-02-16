@@ -37,7 +37,7 @@ static const uint32_t GPSBaud = 9600;
 
 // Time zone offset (in hours)
 // Example: UTC+2 (Central European Time)
-const int TIME_ZONE_OFFSET = 2;
+int time_zone_offset = 2;
 
 TinyGPSPlus gps;
 
@@ -59,7 +59,8 @@ struct DateTime {
 enum USER_COMMANDS
 {
   RAW = 0,
-  CLOCK = 1
+  CLOCK = 1,
+  OFFSET = 2,
 };
 
 // Lookup table for digits 0-9
@@ -93,6 +94,8 @@ const uint8_t  f = 0b11111011;
 const uint8_t  g = 0b11111101;
 const uint8_t dp = 0b11111110;
 
+bool first_serial_connected = false;
+
 /**********************************************
  * Function prototypes
  **********************************************/
@@ -103,10 +106,10 @@ void local_date_time(DateTime &dt);
 void write_to_display(uint32_t data);
 void process_user_cmd(int cmd);
 void run_gps(int print);
+void print_serial_cmds();
 
 void print_local_time();
 void display_gps_info();
-static void smartDelay(unsigned long ms);
 
 
 /*********************************************/
@@ -127,6 +130,7 @@ void loop()
 
   unsigned long current_millis = millis();
   static unsigned long prev_millis = 0;
+  static unsigned long prev_dot_millis = 0;
 
   static int user_cmd =  CLOCK; // User command to execute (serial print)
 
@@ -146,16 +150,26 @@ void loop()
     if (cmd_in.equalsIgnoreCase("RAW"))
     {
       user_cmd = RAW;
-    } 
+    }
     else if (cmd_in.equalsIgnoreCase("CLOCK"))
     {
       user_cmd = CLOCK;
     }
+    else if(cmd_in.startsWith("OFFSET")) // Example: OFFSET-2
+    {
+      //char offset_sign = cmd_in.substring(6, 7).charAt(0); // Extract the 6th character
+      //int offset_num = cmd_in.substring(7, 8).toInt(); // Extract the 8th character
+      // Extract the offset value (e.g., "+2" or "-3")
+      String offsetStr = cmd_in.substring(6); // Remove "OFFSET"
+      int offset = offsetStr.toInt(); // Convert to integer
+      time_zone_offset = offset; // Update the time zone offset
+
+      user_cmd = OFFSET;
+    }
     else
     {
-      char buffer[120];
-      sprintf(buffer, "Unknown command: %s\nAvailable commands:\nRAW: Print raw GPS data\nCLOCK: Print GPS date and time\n", cmd_in.c_str());
-      Serial.print(buffer);
+      Serial.println("Unknown command!");
+      print_serial_cmds();
     }
   }
 
@@ -164,18 +178,28 @@ void loop()
   switch (user_cmd)
   {
     case RAW:
-      //print_raw_gps();
       run_gps(PRINT_RAW_GPS);
       break;
   
     case CLOCK:
-      //smartDelay(500);
       run_gps(0);
-
+      break;
+    
+    case OFFSET:
+      // TODO:
+      run_gps(0);
       break;
 
     default:
       break;
+  }
+
+  if (current_millis - prev_dot_millis >= 500)
+  {
+    prev_dot_millis = current_millis;
+    //Serial.println("-----------------------------Toggle dot");
+    display_data ^= dot_bitmask; // Toggle the dot
+    write_to_display(display_data);
   }
 
   if (current_millis - prev_millis >= 1000)
@@ -195,7 +219,7 @@ void loop()
     
     write_to_display(display_data);
 
-    if (user_cmd == CLOCK)
+    if (user_cmd == CLOCK || user_cmd == OFFSET)
     {
       Serial.print("UTC Time: ");
       print_date_time(UTC_time);
@@ -210,23 +234,6 @@ void loop()
 
 
 /*********************************************/
-
-// This custom version of delay() ensures that the gps object
-// is being "fed".
-static void smartDelay(unsigned long ms)
-{
-  unsigned long start = millis();
-  do
-  {
-    // Check if there is data available from the GPS module
-    while (GPS_Serial.available())
-    {
-      // Pass the data to the TinyGPS++ object
-      gps.encode(GPS_Serial.read());
-    }
-  } while (millis() - start < ms);
-}
-
 
 /**
  * Print a byte of data from GPS
@@ -324,7 +331,7 @@ void print_local_time() {
     int year = gps.date.year();
 
     // Calculate local time by applying the time zone offset
-    int localHour = utc_hour + TIME_ZONE_OFFSET;
+    int localHour = utc_hour + time_zone_offset;
 
     // Handle overflow (e.g., if localHour >= 24)
     if (localHour >= 24) {
@@ -390,7 +397,7 @@ bool update_date_time(DateTime &dt) {
  */
 void local_date_time(DateTime &dt) {
   // Calculate local time by applying the time zone offset
-  dt.hour += TIME_ZONE_OFFSET;
+  dt.hour += time_zone_offset;
 
   // Handle overflow (e.g., if localHour >= 24)
   if (dt.hour >= 24) {
@@ -438,8 +445,11 @@ void write_to_display(uint32_t data)
 /**
  * 
  */
-void process_user_cmd(int cmd)
+void print_serial_cmds()
 {
-  // pass
+  Serial.println("Available commands:");
+  Serial.println("\tRAW: Print raw GPS data");
+  Serial.println("\tCLOCK: Print GPS date and time");
+  Serial.println("\tOFFSET: Set the time zone offset (e.g., OFFSET+2)");
 }
 
