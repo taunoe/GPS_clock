@@ -3,7 +3,7 @@
  * Local date and time from GPS module
  * Started: 08.02.2025
  * Tauno Erik
- * Edited: 09.02.2025
+ * Edited: 16.02.2025
  * 
  * PPS -
  * RXD -
@@ -11,28 +11,40 @@
  * GND - GND
  * VCC - 3.3V
  * 
+ * SDA - GPIO4 (ESP8266 - D2)
+ * SCL - GPIO5 (ESP8266 - D1)
+ * 
  * 
  */
 #include <Arduino.h>
 #include <SoftwareSerial.h>
-#include <TinyGPSPlus.h>  // https://github.com/mikalhart/TinyGPSPlus/tree/master/examples
+#include <TinyGPSPlus.h>    // https://github.com/mikalhart/TinyGPSPlus/tree/master/examples
 
-int cmd =  0;
+// Shift Register 74HC595 pins
+static const int DATA_PIN = D4;
+static const int LATCH_PIN = D3;
+static const int CLOCK_PIN = D2;
 
+// ESP8266
 static const int  RX_PIN  = D7;
 static const int  TX_PIN = D8;
-static const uint32_t GPSBaud = 9600;
-// Time zone offset (in hours)
-const int TIME_ZONE_OFFSET = 2;  // Example: UTC+2 (Central European Time)
 
-// The TinyGPS++ object
+// Arduino Nano
+//static const int  RX_PIN  = 4;
+//static const int  TX_PIN = 5;
+
+static const uint32_t GPSBaud = 9600;
+
+// Time zone offset (in hours)
+// Example: UTC+2 (Central European Time)
+const int TIME_ZONE_OFFSET = 2;
+
 TinyGPSPlus gps;
 
 // The serial connection to the GPS device
 SoftwareSerial GPS_Serial(RX_PIN, TX_PIN);
 
-String inputString = "";      // a String to hold incoming data
-bool stringComplete = false;  // whether the string is complete
+#define PRINT_RAW_GPS 1
 
 // A struct to store date and time
 struct DateTime {
@@ -44,20 +56,57 @@ struct DateTime {
   int second;
 };
 
+enum USER_COMMANDS
+{
+  RAW = 0,
+  CLOCK = 1
+};
+
+// Lookup table for digits 0-9
+// MSBFIRST
+// 0 - ON, 1 - OFF
+const uint8_t digits[10] = {
+  0b00000011, // 0
+  0b10011111, // 1
+  0b00100101, // 2
+  0b00001101, // 3
+  0b10011001, // 4
+  0b01001001, // 5
+  0b11000001, // 6
+  0b00011111, // 7
+  0b00000001, // 8
+  0b00001001  // 9
+};
+
+uint32_t display_data = 0;
+
+uint8_t hour_minut_dot_pos = 16;
+uint32 dot_bitmask = 1 << hour_minut_dot_pos;
+
+// 7-segment led bits
+const uint8_t  a = 0b01111111;
+const uint8_t  b = 0b10111111;
+const uint8_t  c = 0b11011111;
+const uint8_t  d = 0b11101111;
+const uint8_t  e = 0b11110111;
+const uint8_t  f = 0b11111011;
+const uint8_t  g = 0b11111101;
+const uint8_t dp = 0b11111110;
+
 /**********************************************
  * Function prototypes
  **********************************************/
 void print_raw_gps();
 void print_date_time(const DateTime &dt);
-void update_date_time(DateTime &dt);
+bool update_date_time(DateTime &dt);
 void local_date_time(DateTime &dt);
+void write_to_display(uint32_t data);
+void process_user_cmd(int cmd);
+void run_gps(int print);
 
 void print_local_time();
 void display_gps_info();
 static void smartDelay(unsigned long ms);
-static void printFloat(float val, bool valid, int len, int prec);
-static void printInt(unsigned long val, bool valid, int len);
-static void printDateTime(TinyGPSDate &d, TinyGPSTime &t);
 
 
 /*********************************************/
@@ -65,60 +114,96 @@ void setup() {
   Serial.begin(9600);
   GPS_Serial.begin(GPSBaud);
 
-
+  // Initialize the shift register pins
+  pinMode(DATA_PIN, OUTPUT);
+  pinMode(LATCH_PIN, OUTPUT);
+  pinMode(CLOCK_PIN, OUTPUT);
 }
 
-void loop() {
-  // An instance of the DateTime struct
-  DateTime currentDateTime;
+void loop()
+{
+  DateTime UTC_time;
+  DateTime local_time;
+
+  unsigned long current_millis = millis();
+  static unsigned long prev_millis = 0;
+
+  static int user_cmd =  CLOCK; // User command to execute (serial print)
+
+  static uint8_t h1 = 0; // for displaying hours and minutes
+  static uint8_t h2 = 0;
+  static uint8_t m1 = 0;
+  static uint8_t m2 = 0;
+
 
   // Check if data is available on the Serial port
   if (Serial.available() > 0)
   {
-    // Read the incoming command
-    String command = Serial.readStringUntil('\n'); // Read until newline
-    command.trim(); // Remove any extra whitespace
-    //Serial.print("IN: ");
-    //Serial.println(command);
-    if (command.equalsIgnoreCase("RAW"))
+    String cmd_in = Serial.readStringUntil('\n');
+
+    cmd_in.trim(); // Remove any extra whitespace
+
+    if (cmd_in.equalsIgnoreCase("RAW"))
     {
-      cmd = 0;
+      user_cmd = RAW;
     } 
-    else if (command.equalsIgnoreCase("CLOCK"))
+    else if (cmd_in.equalsIgnoreCase("CLOCK"))
     {
-      cmd = 1;
+      user_cmd = CLOCK;
     }
     else
     {
-      Serial.println("Unknown command: " + command);
+      char buffer[120];
+      sprintf(buffer, "Unknown command: %s\nAvailable commands:\nRAW: Print raw GPS data\nCLOCK: Print GPS date and time\n", cmd_in.c_str());
+      Serial.print(buffer);
     }
   }
 
-  switch (cmd)
+
+  // Select with data to serial print
+  switch (user_cmd)
   {
-    case 0:
-      print_raw_gps();
+    case RAW:
+      //print_raw_gps();
+      run_gps(PRINT_RAW_GPS);
       break;
   
-    case 1:
-      smartDelay(1000);
+    case CLOCK:
+      //smartDelay(500);
+      run_gps(0);
 
-      // Update the struct with the current GPS UTC date and time
-      update_date_time(currentDateTime);
-
-      // Print the UTC date and time stored in the struct
-      Serial.print("UTC Time: ");
-      print_date_time(currentDateTime);
-
-      // Calculate local time
-      local_date_time(currentDateTime);
-      Serial.print("My Time: ");
-      print_date_time(currentDateTime);
       break;
 
     default:
       break;
   }
+
+  if (current_millis - prev_millis >= 1000)
+  {
+    prev_millis = current_millis;
+     // Update the struct with the current GPS UTC date and time
+    update_date_time(UTC_time);
+    update_date_time(local_time); // still UTC time
+    local_date_time(local_time);
+    h1 = local_time.hour / 10;
+    h2 = local_time.hour % 10;
+    m1 = local_time.minute / 10;
+    m2 = local_time.minute % 10;
+    
+    display_data = digits[h1] << 24 | digits[h2] << 16 | digits[m1] << 8 | digits[m2];
+    //display_data ^= dot_bitmask; // Toggle the dot
+    
+    write_to_display(display_data);
+
+    if (user_cmd == CLOCK)
+    {
+      Serial.print("UTC Time: ");
+      print_date_time(UTC_time);
+      Serial.print("My Time:  ");
+      print_date_time(local_time);
+    }
+  }
+
 
 } // loop end
 
@@ -126,12 +211,47 @@ void loop() {
 
 /*********************************************/
 
+// This custom version of delay() ensures that the gps object
+// is being "fed".
+static void smartDelay(unsigned long ms)
+{
+  unsigned long start = millis();
+  do
+  {
+    // Check if there is data available from the GPS module
+    while (GPS_Serial.available())
+    {
+      // Pass the data to the TinyGPS++ object
+      gps.encode(GPS_Serial.read());
+    }
+  } while (millis() - start < ms);
+}
+
+
+/**
+ * Print a byte of data from GPS
+ */
 void print_raw_gps()
 {
-  while (GPS_Serial.available() > 0){
-    // get the byte data from the GPS
-    byte gpsData = GPS_Serial.read();
-    Serial.write(gpsData);
+  while (GPS_Serial.available() > 0)
+  {
+    uint8_t gps_data = GPS_Serial.read();
+    gps.encode(gps_data); // ? test ?
+    Serial.write(gps_data);
+  }
+}
+
+void run_gps(int print = 0)
+{
+  while (GPS_Serial.available())
+  {
+    uint8_t gps_data = GPS_Serial.read();
+    gps.encode(gps_data);
+    if (print == PRINT_RAW_GPS)
+    {
+      Serial.write(gps_data);
+    }
+    
   }
 }
 
@@ -186,85 +306,7 @@ void display_gps_info()
   Serial.println();
 }
 
-// This custom version of delay() ensures that the gps object
-// is being "fed".
-static void smartDelay(unsigned long ms)
-{
-  unsigned long start = millis();
-  do 
-  {
-    // Check if there is data available from the GPS module
-    while (GPS_Serial.available())
-    {
-      // Pass the data to the TinyGPS++ object
-      gps.encode(GPS_Serial.read());
-    }
-  } while (millis() - start < ms);
-}
 
-
-static void printFloat(float val, bool valid, int len, int prec)
-{
-  if (!valid)
-  {
-    while (len-- > 1)
-      Serial.print('*');
-    Serial.print(' ');
-  }
-  else
-  {
-    Serial.print(val, prec);
-    int vi = abs((int)val);
-    int flen = prec + (val < 0.0 ? 2 : 1); // . and -
-    flen += vi >= 1000 ? 4 : vi >= 100 ? 3 : vi >= 10 ? 2 : 1;
-    for (int i=flen; i<len; ++i)
-      Serial.print(' ');
-  }
-  smartDelay(0);
-}
-
-static void printInt(unsigned long val, bool valid, int len)
-{
-  char sz[32] = "*****************";
-  if (valid)
-    sprintf(sz, "%ld", val);
-  sz[len] = 0;
-  for (int i=strlen(sz); i<len; ++i)
-    sz[i] = ' ';
-  if (len > 0) 
-    sz[len-1] = ' ';
-  Serial.print(sz);
-  smartDelay(0);
-}
-
-
-static void printDateTime(TinyGPSDate &d, TinyGPSTime &t)
-{
-  if (!d.isValid())
-  {
-    Serial.print(F("********** "));
-  }
-  else
-  {
-    char sz[32];
-    sprintf(sz, "%02d/%02d/%02d ", d.month(), d.day(), d.year());
-    Serial.print(sz);
-  }
-  
-  if (!t.isValid())
-  {
-    Serial.print(F("******** "));
-  }
-  else
-  {
-    char sz[32];
-    sprintf(sz, "%02d:%02d:%02d ", t.hour(), t.minute(), t.second());
-    Serial.print(sz);
-  }
-
-  printInt(d.age(), d.isValid(), 5);
-  smartDelay(0);
-}
 
 
 
@@ -327,7 +369,7 @@ void print_date_time(const DateTime &dt) {
 /**
  * Function to update the struct with the current GPS date and time
  */
-void update_date_time(DateTime &dt) {
+bool update_date_time(DateTime &dt) {
   if (gps.date.isValid() && gps.time.isValid())
   {
     dt.year = gps.date.year();
@@ -337,8 +379,10 @@ void update_date_time(DateTime &dt) {
     dt.minute = gps.time.minute();
     dt.second = gps.time.second();
   } else {
-    Serial.println("Waiting for valid GPS date and time...");
+    Serial.println("Waiting for valid GPS date and time");
+    return false;
   }
+  return true;
 }
 
 /**
@@ -358,3 +402,44 @@ void local_date_time(DateTime &dt) {
   }
 
 }
+
+/**
+ * Function to write data to the shift register
+ */
+void write_to_display(uint32_t data)
+{
+  uint8_t bit_order = MSBFIRST; // MSBFIRST; // Most significant bit first
+  int size = 32; // 8 bits * 4 shift registers
+
+  digitalWrite(LATCH_PIN, LOW);
+
+  for (int i = 0; i < size; i++)
+  {
+    if (bit_order == LSBFIRST)
+    {
+      digitalWrite(DATA_PIN, data & 1); // Send the least significant bit
+      data >>= 1; // Shift right to get the next bit
+    }
+    else // MSBFIRST
+    {
+      digitalWrite(DATA_PIN, (data & 0x80000000) ? HIGH : LOW); // Send the most significant bit
+      data <<= 1; // Shift left to get the next bit
+    }
+
+    // Pulse the clock pin to shift the bit into the 74HC595
+    digitalWrite(CLOCK_PIN, HIGH);
+    digitalWrite(CLOCK_PIN, LOW);
+  }
+
+  digitalWrite(LATCH_PIN, HIGH);
+}
+
+
+/**
+ * 
+ */
+void process_user_cmd(int cmd)
+{
+  // pass
+}
+
