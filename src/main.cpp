@@ -3,7 +3,7 @@
  * Local date and time from GPS module
  * Started: 08.02.2025
  * Tauno Erik
- * Edited: 16.02.2025
+ * Edited: 23.02.2025
  * 
  * PPS -
  * RXD -
@@ -20,18 +20,28 @@
 #include <SoftwareSerial.h>
 #include <TinyGPSPlus.h>    // https://github.com/mikalhart/TinyGPSPlus/tree/master/examples
 
-// Shift Register 74HC595 pins
-static const int DATA_PIN = D4;
-static const int LATCH_PIN = D3;
-static const int CLOCK_PIN = D2;
+#define PRINT_RAW_GPS   1
+#define PRINT_DATE_TIME 0
 
-// ESP8266
-static const int  RX_PIN  = D7;
-static const int  TX_PIN = D8;
+#ifdef ESP8266
+  // Shift Register 74HC595 pins
+  static const int DATA_PIN  = D4;
+  static const int LATCH_PIN = D3;
+  static const int CLOCK_PIN = D2;
 
-// Arduino Nano
-//static const int  RX_PIN  = 4;
-//static const int  TX_PIN = 5;
+  // GPS module pins
+  static const int  RX_PIN = D7;
+  static const int  TX_PIN = D8;
+#elif defined(ARDUINO_AVR_NANO)
+  // GPS module pins
+  static const int  RX_PIN = 5;
+  static const int  TX_PIN = 4;
+  // Shift Register 74HC595 pins
+  static const int DATA_PIN  = 8;
+  static const int LATCH_PIN = 9;
+  static const int CLOCK_PIN = 10;
+#endif
+
 
 static const uint32_t GPSBaud = 9600;
 
@@ -44,7 +54,6 @@ TinyGPSPlus gps;
 // The serial connection to the GPS device
 SoftwareSerial GPS_Serial(RX_PIN, TX_PIN);
 
-#define PRINT_RAW_GPS 1
 
 // A struct to store date and time
 struct DateTime {
@@ -79,10 +88,11 @@ const uint8_t digits[10] = {
   0b00001001  // 9
 };
 
-uint32_t display_data = 0;
+uint32_t numbers_data = 0;
+uint32_t display_data = 0; // liidetud
 
 uint8_t hour_minut_dot_pos = 16;
-uint32 dot_bitmask = 1 << hour_minut_dot_pos;
+uint32_t dot_bitmask = 1 << hour_minut_dot_pos;
 
 // 7-segment led bits
 const uint8_t  a = 0b01111111;
@@ -94,7 +104,27 @@ const uint8_t  f = 0b11111011;
 const uint8_t  g = 0b11111101;
 const uint8_t dp = 0b11111110;
 
-bool first_serial_connected = false;
+//
+int overlay_delay = 100; // Pausi aeg millisekundites
+unsigned long overlay_prev_millis = 0; // Eelmise mustri kuvamise aeg
+int overlay_current_index = 0; // Praeguse mustri indeks
+
+const uint32_t overlay_patterns[] = {
+    0b11111111111111111111111101111111,
+    0b11111111111111110111111111111111,
+    0b11111111011111111111111111111111,
+    0b01111111111111111111111111111111,
+    0b11111011111111111111111111111111,
+    0b11110111111111111111111111111111,
+    0b11101111111111111111111111111111,
+    0b11111111111011111111111111111111,
+    0b11111111111111111110111111111111,
+    0b11111111111111111111111111101111,
+    0b11111111111111111111111111011111,
+    0b11111111111111111111111110111111
+};
+
+const int num_patterns = sizeof(overlay_patterns) / sizeof(overlay_patterns[0]);
 
 /**********************************************
  * Function prototypes
@@ -168,7 +198,8 @@ void loop()
     }
     else
     {
-      Serial.println("Unknown command!");
+      Serial.print("Unknown command: ");
+      Serial.println(cmd_in);
       print_serial_cmds();
     }
   }
@@ -182,42 +213,62 @@ void loop()
       break;
   
     case CLOCK:
-      run_gps(0);
+      run_gps(PRINT_DATE_TIME);
       break;
     
     case OFFSET:
       // TODO:
-      run_gps(0);
+      run_gps(PRINT_DATE_TIME);
       break;
 
     default:
       break;
   }
 
+  //////////
+  if (current_millis - overlay_prev_millis >= overlay_delay) {
+    overlay_prev_millis = current_millis;
+
+    // merge
+    //display_data = numbers_data & overlay_patterns[overlay_current_index];
+    //write_to_display(display_data);
+    write_to_display(numbers_data);
+
+    overlay_current_index++;
+    if (overlay_current_index >= num_patterns) {
+      overlay_current_index = 0;
+    }
+  }
+
   if (current_millis - prev_dot_millis >= 500)
   {
     prev_dot_millis = current_millis;
     //Serial.println("-----------------------------Toggle dot");
-    display_data ^= dot_bitmask; // Toggle the dot
-    write_to_display(display_data);
+    numbers_data ^= dot_bitmask; // Toggle the dot
+
+    //display_data = numbers_data & overlay_patterns[overlay_current_index];
+    //write_to_display(display_data);
+    write_to_display(numbers_data);
   }
 
   if (current_millis - prev_millis >= 1000)
   {
     prev_millis = current_millis;
      // Update the struct with the current GPS UTC date and time
-    update_date_time(UTC_time);
-    update_date_time(local_time); // still UTC time
+    bool no_time = update_date_time(UTC_time);
+    no_time = update_date_time(local_time); // still UTC time
     local_date_time(local_time);
     h1 = local_time.hour / 10;
     h2 = local_time.hour % 10;
     m1 = local_time.minute / 10;
     m2 = local_time.minute % 10;
     
-    display_data = digits[h1] << 24 | digits[h2] << 16 | digits[m1] << 8 | digits[m2];
-    //display_data ^= dot_bitmask; // Toggle the dot
+    numbers_data = digits[h1] << 24 | digits[h2] << 16 | digits[m1] << 8 | digits[m2];
+    //numbers_data ^= dot_bitmask; // Toggle the dot
     
-    write_to_display(display_data);
+    //display_data = overlay_patterns[overlay_current_index];
+    write_to_display(numbers_data);
+
 
     if (user_cmd == CLOCK || user_cmd == OFFSET)
     {
@@ -262,6 +313,9 @@ void run_gps(int print = 0)
   }
 }
 
+/**
+ * 
+ */
 void display_gps_info()
 {
   Serial.print(F("Location: ")); 
@@ -317,7 +371,9 @@ void display_gps_info()
 
 
 
-
+/**
+ * 
+ */
 // Function to calculate local time
 void print_local_time() {
   if (gps.time.isValid() && gps.date.isValid())
@@ -356,9 +412,10 @@ void print_local_time() {
     Serial.print(":");
     Serial.println(utc_second);
   } else {
-    Serial.println("Waiting for valid GPS time...");
+    Serial.println("2 Waiting for valid GPS time...");
   }
 }
+
 
 /**
  * Function to print the date and time stored in the struct
@@ -373,6 +430,7 @@ void print_date_time(const DateTime &dt) {
   Serial.println(buffer);
 }
 
+
 /**
  * Function to update the struct with the current GPS date and time
  */
@@ -386,11 +444,12 @@ bool update_date_time(DateTime &dt) {
     dt.minute = gps.time.minute();
     dt.second = gps.time.second();
   } else {
-    Serial.println("Waiting for valid GPS date and time");
+    Serial.println("1 Waiting for valid GPS date and time");
     return false;
   }
   return true;
 }
+
 
 /**
  * Function to calculate local date and time
@@ -409,6 +468,7 @@ void local_date_time(DateTime &dt) {
   }
 
 }
+
 
 /**
  * Function to write data to the shift register
