@@ -3,7 +3,7 @@
  * Local date and time from GPS module
  * Started: 08.02.2025
  * Tauno Erik
- * Edited: 23.02.2025
+ * Edited: 24.02.2025
  * 
  * PPS -
  * RXD -
@@ -19,41 +19,7 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
 #include <TinyGPSPlus.h>    // https://github.com/mikalhart/TinyGPSPlus/tree/master/examples
-
-#define PRINT_RAW_GPS   1
-#define PRINT_DATE_TIME 0
-
-#ifdef ESP8266
-  // Shift Register 74HC595 pins
-  static const int DATA_PIN  = D4;
-  static const int LATCH_PIN = D3;
-  static const int CLOCK_PIN = D2;
-
-  // GPS module pins
-  static const int  RX_PIN = D7;
-  static const int  TX_PIN = D8;
-#elif defined(ARDUINO_AVR_NANO)
-  // GPS module pins
-  static const int  RX_PIN = 5;
-  static const int  TX_PIN = 4;
-  // Shift Register 74HC595 pins
-  static const int DATA_PIN  = 8;
-  static const int LATCH_PIN = 9;
-  static const int CLOCK_PIN = 10;
-#endif
-
-
-static const uint32_t GPSBaud = 9600;
-
-// Time zone offset (in hours)
-// Example: UTC+2 (Central European Time)
-int time_zone_offset = 2;
-
-TinyGPSPlus gps;
-
-// The serial connection to the GPS device
-SoftwareSerial GPS_Serial(RX_PIN, TX_PIN);
-
+#include <EEPROM.h>
 
 // A struct to store date and time
 struct DateTime {
@@ -65,12 +31,54 @@ struct DateTime {
   int second;
 };
 
+// A Struct to store settings
+struct Settings {
+  int time_zone_offset;
+  bool is_daylight_saving; // or summer_time and wintter_time
+};
+
+// Create an instance of the Settings struct
+Settings settings;
+
+// Default settings values
+// Time zone offset (in hours)
+// Example: UTC+2 (Central European Time)
+const Settings default_settings = {
+  .time_zone_offset = 2,    // Default time zone offset (UTC)
+  .is_daylight_saving = false // Default daylight saving (disabled)
+};
+
 enum USER_COMMANDS
 {
   RAW = 0,
   CLOCK = 1,
   OFFSET = 2,
+  DAYLIGHT = 3,
 };
+
+#define PRINT_DATE_TIME 0
+#define PRINT_RAW_GPS   1
+
+#define DOT_TOGGLE_TIME    500
+#define CLOCK_UPDATE_TIME 1000
+
+// 115200 bps: The default baud rate for most ESP8266
+// 230400 bps: A good compromise between speed and reliability
+// 460800 bps: Suitable for high-speed communication with minimal errors
+// 921600 bps: The highest commonly used baud rate for reliable communication
+static const int BAUD_RATE = 115200;
+
+// Shift Register 74HC595 pins
+static const int DATA_PIN  = D4;
+static const int LATCH_PIN = D3;
+static const int CLOCK_PIN = D2;
+
+// GPS module pins
+static const int  RX_PIN = D7;
+static const int  TX_PIN = D8;
+
+static const uint32_t GPSBaud = 9600;
+
 
 // Lookup table for digits 0-9
 // MSBFIRST
@@ -104,7 +112,7 @@ const uint8_t  f = 0b11111011;
 const uint8_t  g = 0b11111101;
 const uint8_t dp = 0b11111110;
 
-//
+/*
 int overlay_delay = 100; // Pausi aeg millisekundites
 unsigned long overlay_prev_millis = 0; // Eelmise mustri kuvamise aeg
 int overlay_current_index = 0; // Praeguse mustri indeks
@@ -124,33 +132,44 @@ const uint32_t overlay_patterns[] = {
     0b11111111111111111111111110111111
 };
 
-const int num_patterns = sizeof(overlay_patterns) / sizeof(overlay_patterns[0]);
+const int num_overlay_patterns = sizeof(overlay_patterns) / sizeof(overlay_patterns[0]);
+*/
+
+TinyGPSPlus gps;
+
+// The serial connection to the GPS device
+SoftwareSerial GPS_Serial(RX_PIN, TX_PIN);
 
 /**********************************************
  * Function prototypes
  **********************************************/
-void print_raw_gps();
 void print_date_time(const DateTime &dt);
 bool update_date_time(DateTime &dt);
 void local_date_time(DateTime &dt);
 void write_to_display(uint32_t data);
-void process_user_cmd(int cmd);
 void run_gps(int print);
 void print_serial_cmds();
 
-void print_local_time();
-void display_gps_info();
-
+void load_settings();
+void save_settings();
+void print_settings();
 
 /*********************************************/
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(BAUD_RATE);
   GPS_Serial.begin(GPSBaud);
 
   // Initialize the shift register pins
   pinMode(DATA_PIN, OUTPUT);
   pinMode(LATCH_PIN, OUTPUT);
   pinMode(CLOCK_PIN, OUTPUT);
+
+  // Initialize EEPROM with 4096 bytes (max size for ESP8266)
+  EEPROM.begin(4096);
+
+  // Load settings from EEPROM
+  load_settings();
+  print_settings();
 }
 
 void loop()
@@ -162,7 +181,7 @@ void loop()
   static unsigned long prev_millis = 0;
   static unsigned long prev_dot_millis = 0;
 
-  static int user_cmd =  CLOCK; // User command to execute (serial print)
+  static int user_cmd =  CLOCK; // User command to execute
 
   static uint8_t h1 = 0; // for displaying hours and minutes
   static uint8_t h2 = 0;
@@ -187,14 +206,21 @@ void loop()
     }
     else if(cmd_in.startsWith("OFFSET")) // Example: OFFSET-2
     {
-      //char offset_sign = cmd_in.substring(6, 7).charAt(0); // Extract the 6th character
-      //int offset_num = cmd_in.substring(7, 8).toInt(); // Extract the 8th character
       // Extract the offset value (e.g., "+2" or "-3")
-      String offsetStr = cmd_in.substring(6); // Remove "OFFSET"
-      int offset = offsetStr.toInt(); // Convert to integer
-      time_zone_offset = offset; // Update the time zone offset
-
+      String offset_str = cmd_in.substring(6); // Remove "OFFSET"
+      int offset = offset_str.toInt();         // Convert to integer
+      settings.time_zone_offset = offset;      // Update the time zone offset
+      save_settings();                         // Save the settings to EEPROM
       user_cmd = OFFSET;
+    }
+    else if(cmd_in.startsWith("DAYLIGHT"))
+    {
+      // Extract the daylight saving value (e.g., "ON" or "OFF")
+      String daylight_str = cmd_in.substring(8); // Remove "DAYLIGHT"
+      bool daylight = daylight_str.equalsIgnoreCase("ON");
+      settings.is_daylight_saving = daylight;    // Update the daylight saving setting
+      save_settings();                           // Save the settings to EEPROM
+      user_cmd = DAYLIGHT;
     }
     else
     {
@@ -213,11 +239,8 @@ void loop()
       break;
   
     case CLOCK:
-      run_gps(PRINT_DATE_TIME);
-      break;
-    
     case OFFSET:
-      // TODO:
+    case DAYLIGHT:
       run_gps(PRINT_DATE_TIME);
       break;
 
@@ -226,6 +249,7 @@ void loop()
   }
 
   //////////
+  /*
   if (current_millis - overlay_prev_millis >= overlay_delay) {
     overlay_prev_millis = current_millis;
 
@@ -235,42 +259,46 @@ void loop()
     write_to_display(numbers_data);
 
     overlay_current_index++;
-    if (overlay_current_index >= num_patterns) {
+    if (overlay_current_index >= num_overlay_patterns) {
       overlay_current_index = 0;
     }
   }
+    */
 
-  if (current_millis - prev_dot_millis >= 500)
+  // Time to toggle the dot
+  if (current_millis - prev_dot_millis >= DOT_TOGGLE_TIME)
   {
     prev_dot_millis = current_millis;
-    //Serial.println("-----------------------------Toggle dot");
     numbers_data ^= dot_bitmask; // Toggle the dot
-
-    //display_data = numbers_data & overlay_patterns[overlay_current_index];
-    //write_to_display(display_data);
     write_to_display(numbers_data);
   }
 
-  if (current_millis - prev_millis >= 1000)
+  // Time to update the Clock
+  if (current_millis - prev_millis >= CLOCK_UPDATE_TIME)
   {
     prev_millis = current_millis;
      // Update the struct with the current GPS UTC date and time
     bool no_time = update_date_time(UTC_time);
     no_time = update_date_time(local_time); // still UTC time
+    if (no_time)
+    {
+      // time data not avaible!
+    }
+
     local_date_time(local_time);
+
+    // 8-bit numbers to display on the 7-segment display
     h1 = local_time.hour / 10;
     h2 = local_time.hour % 10;
     m1 = local_time.minute / 10;
     m2 = local_time.minute % 10;
     
+    // 32-bit number to display on the 7-segment display
     numbers_data = digits[h1] << 24 | digits[h2] << 16 | digits[m1] << 8 | digits[m2];
-    //numbers_data ^= dot_bitmask; // Toggle the dot
     
-    //display_data = overlay_patterns[overlay_current_index];
     write_to_display(numbers_data);
 
-
-    if (user_cmd == CLOCK || user_cmd == OFFSET)
+    if (user_cmd != RAW)
     {
       Serial.print("UTC Time: ");
       print_date_time(UTC_time);
@@ -279,26 +307,17 @@ void loop()
     }
   }
 
-
 } // loop end
 
 
 
 /*********************************************/
 
-/**
- * Print a byte of data from GPS
- */
-void print_raw_gps()
-{
-  while (GPS_Serial.available() > 0)
-  {
-    uint8_t gps_data = GPS_Serial.read();
-    gps.encode(gps_data); // ? test ?
-    Serial.write(gps_data);
-  }
-}
 
+/**
+ * Function to read data from the GPS module
+ * @param print: 1 - Print the raw GPS data
+ */
 void run_gps(int print = 0)
 {
   while (GPS_Serial.available())
@@ -309,132 +328,33 @@ void run_gps(int print = 0)
     {
       Serial.write(gps_data);
     }
-    
-  }
-}
-
-/**
- * 
- */
-void display_gps_info()
-{
-  Serial.print(F("Location: ")); 
-  if (gps.location.isValid())
-  {
-    Serial.print(gps.location.lat(), 6);
-    Serial.print(F(","));
-    Serial.print(gps.location.lng(), 6);
-  }
-  else
-  {
-    Serial.print(F("INVALID"));
-  }
-
-  Serial.print(F("  Date/Time: "));
-  if (gps.date.isValid())
-  {
-    Serial.print(gps.date.month());
-    Serial.print(F("/"));
-    Serial.print(gps.date.day());
-    Serial.print(F("/"));
-    Serial.print(gps.date.year());
-  }
-  else
-  {
-    Serial.print(F("INVALID"));
-  }
-
-  Serial.print(F(" "));
-  if (gps.time.isValid())
-  {
-    if (gps.time.hour() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.hour());
-    Serial.print(F(":"));
-    if (gps.time.minute() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.minute());
-    Serial.print(F(":"));
-    if (gps.time.second() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.second());
-    Serial.print(F("."));
-    if (gps.time.centisecond() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.centisecond());
-  }
-  else
-  {
-    Serial.print(F("INVALID"));
-  }
-
-  Serial.println();
-}
-
-
-
-
-
-/**
- * 
- */
-// Function to calculate local time
-void print_local_time() {
-  if (gps.time.isValid() && gps.date.isValid())
-  {
-    // Get UTC time from GPS
-    int utc_hour = gps.time.hour();
-    int utc_minute = gps.time.minute();
-    int utc_second = gps.time.second();
-    int day = gps.date.day();
-    int month = gps.date.month();
-    int year = gps.date.year();
-
-    // Calculate local time by applying the time zone offset
-    int localHour = utc_hour + time_zone_offset;
-
-    // Handle overflow (e.g., if localHour >= 24)
-    if (localHour >= 24) {
-      localHour -= 24;
-      day += 1;  // Increment the day
-    } else if (localHour < 0) {
-      localHour += 24;
-      day -= 1;  // Decrement the day
-    }
-
-    // Print local time
-    Serial.print("Local Time: ");
-    Serial.print(year);
-    Serial.print("-");
-    Serial.print(month);
-    Serial.print("-");
-    Serial.print(day);
-    Serial.print(" ");
-    Serial.print(localHour);
-    Serial.print(":");
-    Serial.print(utc_minute);
-    Serial.print(":");
-    Serial.println(utc_second);
-  } else {
-    Serial.println("2 Waiting for valid GPS time...");
   }
 }
 
 
 /**
  * Function to print the date and time stored in the struct
+ * @param dt: DateTime struct with the date and time
  */
-void print_date_time(const DateTime &dt) {
+void print_date_time(const DateTime &dt)
+{
   char buffer[20];  // Buffer to store the formatted string
   // Make sure the buffer is large enough to hold the final string
 
   sprintf(buffer, "%02d:%02d:%02d %02d/%02d/%02d",
           dt.hour, dt.minute, dt.second, dt.day, dt.month, dt.year);
-      
+
   Serial.println(buffer);
 }
 
 
 /**
  * Function to update the struct with the current GPS date and time
+ * @param dt: DateTime struct to store the date and time
+ * @return true if the date and time are valid; otherwise, false
  */
-bool update_date_time(DateTime &dt) {
+bool update_date_time(DateTime &dt)
+{
   if (gps.date.isValid() && gps.time.isValid())
   {
     dt.year = gps.date.year();
@@ -443,7 +363,9 @@ bool update_date_time(DateTime &dt) {
     dt.hour = gps.time.hour();
     dt.minute = gps.time.minute();
     dt.second = gps.time.second();
-  } else {
+  }
+  else
+  {
     Serial.println("1 Waiting for valid GPS date and time");
     return false;
   }
@@ -453,25 +375,37 @@ bool update_date_time(DateTime &dt) {
 
 /**
  * Function to calculate local date and time
+ * @param dt: DateTime struct with UTC date and time
  */
-void local_date_time(DateTime &dt) {
+void local_date_time(DateTime &dt)
+{
   // Calculate local time by applying the time zone offset
-  dt.hour += time_zone_offset;
+  dt.hour += settings.time_zone_offset;
+
+  if (settings.is_daylight_saving)
+  {
+    // TODO
+    // Add 1 hour for daylight saving time
+    // dt.hour += 1;
+  }
 
   // Handle overflow (e.g., if localHour >= 24)
-  if (dt.hour >= 24) {
+  if (dt.hour >= 24)
+  {
     dt.hour -= 24;
     dt.day += 1;  // Increment the day
-  } else if (dt.hour < 0) {
+  }
+  else if (dt.hour < 0)
+  {
     dt.hour += 24;
     dt.day -= 1;  // Decrement the day
   }
-
 }
 
 
 /**
  * Function to write data to the shift register
+ * @param data: 32-bit data to write to the shift register
  */
 void write_to_display(uint32_t data)
 {
@@ -503,7 +437,7 @@ void write_to_display(uint32_t data)
 
 
 /**
- * 
+ * Function to print the available serial commands
  */
 void print_serial_cmds()
 {
@@ -511,5 +445,48 @@ void print_serial_cmds()
   Serial.println("\tRAW: Print raw GPS data");
   Serial.println("\tCLOCK: Print GPS date and time");
   Serial.println("\tOFFSET: Set the time zone offset (e.g., OFFSET+2)");
+  Serial.println("\tDAYLIGHTON: Enable daylight saving");
+  Serial.println("\tDAYLIGHTOFF: Disable daylight saving");
+}
+
+
+/**
+ * Function to load settings from EEPROM
+ */
+void load_settings()
+{
+  int address = 0; // Address in EEPROM
+  // Read the settings from EEPROM
+  EEPROM.get(address, settings); 
+  // Check if the settings are valid (e.g., using a magic number or checksum)
+  if (settings.time_zone_offset < -12 || settings.time_zone_offset > 14)
+  {
+    // If settings are invalid, use default values
+    Serial.println("Invalid settings. Loading defaults.");
+    settings = default_settings;
+    save_settings(); // Save the default settings to EEPROM
+  }
+}
+
+/**
+ * Function to save settings to EEPROM
+ */
+void save_settings()
+{
+  // Write the settings to EEPROM
+  EEPROM.put(0, settings); // Write to address 0
+  EEPROM.commit(); // Commit changes to Flash
+}
+
+/**
+ * Print the loaded settings
+ */
+void print_settings()
+{
+  Serial.println("Loaded Settings:");
+  Serial.print("Time Zone Offset: ");
+  Serial.println(settings.time_zone_offset);
+  Serial.print("Daylight Saving: ");
+  Serial.println(settings.is_daylight_saving ? "Enabled" : "Disabled");
 }
 
