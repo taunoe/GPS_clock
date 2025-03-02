@@ -2,8 +2,8 @@
  * 
  * Local date and time from GPS module
  * Started: 08.02.2025
+ * Edited: 02.03.2025
  * Tauno Erik
- * Edited: 24.02.2025
  * 
  * PPS -
  * RXD -
@@ -31,10 +31,13 @@ struct DateTime {
   int second;
 };
 
+DateTime UTC_time;    // Instance for the UTC time
+DateTime local_time;  // Instance for the local time
+
 // A Struct to store settings
 struct Settings {
   int time_zone_offset;
-  bool is_daylight_saving; // or summer_time and wintter_time
+  bool is_summer_time; // or summer_time and wintter_time
 };
 
 // Create an instance of the Settings struct
@@ -45,7 +48,7 @@ Settings settings;
 // Example: UTC+2 (Central European Time)
 const Settings default_settings = {
   .time_zone_offset = 2,    // Default time zone offset (UTC)
-  .is_daylight_saving = false // Default daylight saving (disabled)
+  .is_summer_time = false // Default daylight saving (disabled)
 };
 
 enum USER_COMMANDS
@@ -154,6 +157,8 @@ void load_settings();
 void save_settings();
 void print_settings();
 
+int get_user_serial_input();
+
 /*********************************************/
 void setup() {
   Serial.begin(BAUD_RATE);
@@ -174,9 +179,6 @@ void setup() {
 
 void loop()
 {
-  DateTime UTC_time;
-  DateTime local_time;
-
   unsigned long current_millis = millis();
   static unsigned long prev_millis = 0;
   static unsigned long prev_dot_millis = 0;
@@ -188,46 +190,10 @@ void loop()
   static uint8_t m1 = 0;
   static uint8_t m2 = 0;
 
-
   // Check if data is available on the Serial port
   if (Serial.available() > 0)
   {
-    String cmd_in = Serial.readStringUntil('\n');
-
-    cmd_in.trim(); // Remove any extra whitespace
-
-    if (cmd_in.equalsIgnoreCase("RAW"))
-    {
-      user_cmd = RAW;
-    }
-    else if (cmd_in.equalsIgnoreCase("CLOCK"))
-    {
-      user_cmd = CLOCK;
-    }
-    else if(cmd_in.startsWith("OFFSET")) // Example: OFFSET-2
-    {
-      // Extract the offset value (e.g., "+2" or "-3")
-      String offset_str = cmd_in.substring(6); // Remove "OFFSET"
-      int offset = offset_str.toInt();         // Convert to integer
-      settings.time_zone_offset = offset;      // Update the time zone offset
-      save_settings();                         // Save the settings to EEPROM
-      user_cmd = OFFSET;
-    }
-    else if(cmd_in.startsWith("DAYLIGHT"))
-    {
-      // Extract the daylight saving value (e.g., "ON" or "OFF")
-      String daylight_str = cmd_in.substring(8); // Remove "DAYLIGHT"
-      bool daylight = daylight_str.equalsIgnoreCase("ON");
-      settings.is_daylight_saving = daylight;    // Update the daylight saving setting
-      save_settings();                           // Save the settings to EEPROM
-      user_cmd = DAYLIGHT;
-    }
-    else
-    {
-      Serial.print("Unknown command: ");
-      Serial.println(cmd_in);
-      print_serial_cmds();
-    }
+    user_cmd = get_user_serial_input();
   }
 
 
@@ -277,12 +243,13 @@ void loop()
   if (current_millis - prev_millis >= CLOCK_UPDATE_TIME)
   {
     prev_millis = current_millis;
-     // Update the struct with the current GPS UTC date and time
+    // Update the struct with the current GPS UTC date and time
     bool no_time = update_date_time(UTC_time);
     no_time = update_date_time(local_time); // still UTC time
+
     if (no_time)
     {
-      // time data not avaible!
+      Serial.println("1 Waiting for valid GPS date and time");
     }
 
     local_date_time(local_time);
@@ -311,13 +278,10 @@ void loop()
 
 
 
-/*********************************************/
-
-
-/**
+/*******************************************************************
  * Function to read data from the GPS module
  * @param print: 1 - Print the raw GPS data
- */
+ ******************************************************************/
 void run_gps(int print = 0)
 {
   while (GPS_Serial.available())
@@ -366,9 +330,9 @@ bool update_date_time(DateTime &dt)
   }
   else
   {
-    Serial.println("1 Waiting for valid GPS date and time");
     return false;
   }
+
   return true;
 }
 
@@ -382,11 +346,17 @@ void local_date_time(DateTime &dt)
   // Calculate local time by applying the time zone offset
   dt.hour += settings.time_zone_offset;
 
-  if (settings.is_daylight_saving)
+  // TODU: Handle daylight saving time
+  // Get the current month and day
+  // Suveaeg on vööndiajast ühe tunni võrra edasi nihutatud kellaaeg.
+  // Suveajale minnakse Euroopas märtsi viimasel pühapäeval 
+  // kell 01:00 UTC (Eestis 3:00) ja tagasi vööndiajale minnakse oktoobri 
+  // viimasel pühapäeval kell 01:00 UTC
+
+  if (settings.is_summer_time)
   {
-    // TODO
     // Add 1 hour for daylight saving time
-    // dt.hour += 1;
+    dt.hour += 1;
   }
 
   // Handle overflow (e.g., if localHour >= 24)
@@ -487,6 +457,52 @@ void print_settings()
   Serial.print("Time Zone Offset: ");
   Serial.println(settings.time_zone_offset);
   Serial.print("Daylight Saving: ");
-  Serial.println(settings.is_daylight_saving ? "Enabled" : "Disabled");
+  Serial.println(settings.is_summer_time ? "Enabled" : "Disabled");
 }
 
+
+/*******************************************************************
+ * Get user input from the Serial port
+ * @return the user command
+ *******************************************************************/
+int get_user_serial_input()
+{
+  String cmd_in = Serial.readStringUntil('\n');
+
+  cmd_in.trim(); // Remove any extra whitespace
+
+  if (cmd_in.equalsIgnoreCase("RAW"))
+  {
+    return RAW;
+  }
+  else if (cmd_in.equalsIgnoreCase("CLOCK"))
+  {
+    return CLOCK;
+  }
+  else if(cmd_in.startsWith("OFFSET")) // Example: OFFSET-2
+  {
+    // Extract the offset value (e.g., "+2" or "-3")
+    String offset_str = cmd_in.substring(6); // Remove "OFFSET"
+    int offset = offset_str.toInt();         // Convert to integer
+    settings.time_zone_offset = offset;      // Update the time zone offset
+    save_settings();                         // Save the settings to EEPROM
+    return OFFSET;
+  }
+  else if(cmd_in.startsWith("DAYLIGHT"))
+  {
+    // Extract the daylight saving value (e.g., "ON" or "OFF")
+    String daylight_str = cmd_in.substring(8); // Remove "DAYLIGHT"
+    bool daylight = daylight_str.equalsIgnoreCase("ON");
+    settings.is_summer_time = daylight;    // Update the daylight saving setting
+    save_settings();                           // Save the settings to EEPROM
+    return DAYLIGHT;
+  }
+  else
+  {
+    Serial.print("Unknown command: ");
+    Serial.println(cmd_in);
+    print_serial_cmds();
+  }
+
+  return -1;
+}
